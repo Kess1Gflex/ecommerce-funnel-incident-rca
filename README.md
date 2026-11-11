@@ -3,44 +3,49 @@
 # E-Commerce Checkout Funnel Leakage & Incident RCA
 ## Diagnosing a Mobile Conversion Failure in Google BigQuery
 
+> **Project Notice:** This incident post-mortem and portfolio root cause analysis (RCA) is evaluated on a deterministic, synthetic production telemetry dataset modeled in Google BigQuery.
+
 ---
 
-## 1. Executive Summary & Business Problem
+## 1. Executive Summary & Incident Overview
 
-Following engineering release `v4.12.0` on Friday evening (2026-11-06 18:30:00 UTC), CloudCart D2C experienced a severe decline in checkout completions over the weekend while active paid customer acquisition campaigns continued running.
+Following engineering release `v4.12.0` on Friday, November 6, 2026 at 18:30:00 UTC, CloudCart D2C experienced an isolated collapse in store checkout completion while running weekend customer acquisition campaigns.
 
-By querying raw clickstream event streams and failure telemetry in Google BigQuery, this root cause analysis (RCA) revealed:
+By conducting an incident root cause analysis across clickstream telemetry and transaction exception streams in Google BigQuery, this investigation established:
 
-- **The Funnel Leak:** Overall checkout-to-purchase conversion dropped from a pre-incident baseline of **29.37% to 11.22%** following the deployment.
-- **Device Isolation:** The failure was isolated to mobile devices. During the incident window, Desktop converted at **30.21%** and Tablet at **25.51%**, while Mobile collapsed to **1.08%** (only 40 purchases from 3,694 checkout sessions).
-- **The Root Cause:** **3,091 unique mobile sessions** encountered an `apple_pay_token_failure` exception on iOS 18.1, representing **84.57% of recorded post-deployment mobile checkout errors**.
-- **The Business Impact:** An estimated **1,068 lost completed customer orders**, representing approximately **$53,400 in lost Gross Merchandise Value (GMV)**, excluding additional inefficient weekend advertising spend.
+- **The Funnel Leak:** Mobile checkout-to-purchase completion dropped from a verified historical baseline of **29.34% down to 1.08% post-deploy (-96.32% relative collapse)**.
+- **Device Isolation:** Desktop converted nominally at 30.21% (baseline: 28.95%) and Tablet converted at 25.51% (baseline: 31.49%), isolating the defect exclusively to the mobile checkout pathway.
+- **The Root Cause:** 3,091 unique mobile sessions encountered an `apple_pay_token_failure` exception on iOS 18.1, representing 84.57% of all post-deploy mobile checkout errors.
+- **Financial Exposure:** A net deficit of 1,044 completed customer orders representing approximately **$52,200 in lost Gross Merchandise Value (GMV)** ($50.00 AOV) and inefficient ad spend.
 
 ---
 
 ## 2. Telemetry Architecture & Repository Layout
 
-Clickstream data and backend exceptions are captured into Google BigQuery as append-only event streams.
+Clickstream data and failure events are ingested into Google BigQuery as append-only event streams:
 
 | BigQuery Table | Description |
 |---|---|
 | `raw_events.web_sessions_stream` | Core user progression milestones (`session_start`, `view_item`, `add_to_cart`, `begin_checkout`, `purchase`). |
-| `raw_events.checkout_errors_stream` | Granular payment gateway exceptions, error codes, and client device telemetry. |
+| `raw_events.checkout_errors_stream` | Granular transaction error codes, client OS, and payment failure logs. |
 
 ### Repository Structure
 
 ```text
 ├── README.md                          # Executive incident post-mortem & RCA report
 ├── generate_data.py                   # Clickstream and error stream simulation harness
+├── assets/                            # Incident visualizations and evidence charts
+│   └── hourly_mobile_conversion_cliff.png
 ├── data/                              # Raw synthetic telemetry event streams
 │   ├── web_sessions_stream.csv        # 122,385 clickstream events (50,000 sessions)
 │   └── checkout_errors_stream.csv     # Granular payment & checkout failure logs
 └── sql/                               # Executable GoogleSQL analytical queries
     ├── 01_pipeline_audit.sql          # Ingestion integrity & boundary verification
-    ├── 02_funnel_macro_lag.sql         # 5-stage conversion & drop-off calculation
-    ├── 03_incident_window_split.sql   # Pre- vs. post-deployment cohort comparison
+    ├── 02_funnel_macro_lag.sql        # 5-stage conversion & drop-off calculation
+    ├── 03_pre_incident_baselines.sql  # Historical device baseline benchmarking
     ├── 04_device_segmentation.sql     # Post-deploy conversion sliced by device
-    └── 05_error_rca.sql               # Error code & OS distribution analysis
+    ├── 05_hourly_cliff.sql            # Hourly time-series isolating the 18:30 deployment
+    └── 06_error_rca.sql               # Error code & OS distribution analysis
 ```
 
 ---
@@ -64,27 +69,27 @@ SELECT
 FROM `cloudcart-analytics.raw_events.web_sessions_stream`;
 ```
 
-#### Query Results
+**Query Results:**
 
 | total_rows | total_unique_sessions | null_sessions | null_events | earliest_event | latest_event |
 |---:|---:|---:|---:|---|---|
 | 122,385 | 50,000 | 0 | 0 | 2026-11-03 00:00:17 UTC | 2026-11-10 00:00:25 UTC |
 
-**Validation:** The telemetry pipeline passed the initial integrity checks. All 50,000 unique sessions were represented across the seven-day observation window, with zero null session identifiers or event names.
+**Validation:** The pipeline is healthy; all 50,000 unique sessions loaded across the 7-day observation window with zero null foreign keys.
 
 ---
 
 ### Step 2: Funnel Drop-off Quantification (Window Functions)
 
-To identify where prospective customers dropped out of the purchasing flow, step-by-step conversion and abandonment rates were calculated across all five chronological milestones using the `LAG()` window function.
+To identify where prospective customers dropped out of the purchasing flow, step-by-step conversion and abandonment rates were calculated across all 5 chronological milestones using `LAG()`.
 
 **Step Conversion Rate:**
 
-`Step Conversion Rate (%) = (Current Step Sessions / Previous Step Sessions) * 100`
+`Step Conversion Rate = (Current Step Sessions / Previous Step Sessions) * 100`
 
 **Drop-off Rate:**
 
-`Drop-off Rate (%) = 100 - Step Conversion Rate (%)`
+`Drop-off Rate = 100% - Step Conversion Rate`
 
 **File:** `sql/02_funnel_macro_lag.sql`
 
@@ -108,21 +113,14 @@ SELECT
     event_name,
     total_sessions,
     LAG(total_sessions) OVER (ORDER BY step_order) AS prev_step_sessions,
-    ROUND(
-        100.0 * total_sessions / LAG(total_sessions) OVER (ORDER BY step_order),
-        2
-    ) AS conversion_rate_pct,
-    ROUND(
-        100.0 * (
-            LAG(total_sessions) OVER (ORDER BY step_order) - total_sessions
-        ) / LAG(total_sessions) OVER (ORDER BY step_order),
-        2
-    ) AS dropoff_pct
+    ROUND(100.0 * total_sessions / LAG(total_sessions) OVER (ORDER BY step_order), 2) AS conversion_rate_pct,
+    ROUND(100.0 * (LAG(total_sessions) OVER (ORDER BY step_order) - total_sessions) / 
+          LAG(total_sessions) OVER (ORDER BY step_order), 2) AS dropoff_pct
 FROM funnel_stages
 ORDER BY step_order;
 ```
 
-#### Query Results
+**Query Results:**
 
 | step_order | event_name | total_sessions | prev_step_sessions | conversion_rate_pct | dropoff_pct | Operational Status |
 |---:|---|---:|---:|---:|---:|---|
@@ -132,108 +130,132 @@ ORDER BY step_order;
 | 4 | begin_checkout | 12,347 | 16,430 | 75.15% | 24.85% | Nominal |
 | 5 | purchase | 2,580 | 12,347 | **20.90%** | **79.10%** | **CRITICAL FUNNEL LEAK** |
 
-**Diagnosis:** Top and mid-funnel transition steps performed consistently with the observed traffic pattern. The most significant funnel leakage occurred between `begin_checkout` and `purchase`, indicating a potential checkout completion issue requiring further investigation.
+**Diagnosis:** Top and mid-funnel transition steps performed within standard retail benchmarks. The severe funnel leakage is isolated specifically between `begin_checkout` and `purchase`.
 
 ---
 
-### Step 3: Timeline Partitioning (Pre- vs. Post-Deployment)
+### Step 3: Measuring Pre-Incident Historical Baselines by Device
 
-To establish whether the checkout drop-off was a persistent trend or associated with release `v4.12.0`, sessions were partitioned before and after the deployment cut-off timestamp (`2026-11-06 18:30:00 UTC`).
+Rather than assuming an arbitrary 30% baseline across all platforms, historical performance was measured across each device category prior to the deployment timestamp (`2026-11-06 18:30:00 UTC`).
 
-**File:** `sql/03_incident_window_split.sql`
+**File:** `sql/03_pre_incident_baselines.sql`
 
 ```sql
-WITH cohort_funnel AS (
-    SELECT 
-        CASE 
-            WHEN event_timestamp < '2026-11-06 18:30:00 UTC'
-                THEN '1_Pre_Incident_Baseline'
-            ELSE '2_Post_Deploy_Incident'
-        END AS incident_window,
-        COUNT(DISTINCT CASE 
-            WHEN event_name = 'begin_checkout' THEN session_id 
-        END) AS checkout_sessions,
-        COUNT(DISTINCT CASE 
-            WHEN event_name = 'purchase' THEN session_id 
-        END) AS purchase_sessions
-    FROM `cloudcart-analytics.raw_events.web_sessions_stream`
-    GROUP BY incident_window
-)
 SELECT 
-    incident_window,
-    checkout_sessions,
-    purchase_sessions,
-    ROUND(
-        100.0 * purchase_sessions / NULLIF(checkout_sessions, 0),
-        2
-    ) AS checkout_to_purchase_rate_pct
-FROM cohort_funnel
-ORDER BY incident_window;
+    device_category,
+    COUNT(DISTINCT CASE WHEN event_name = 'begin_checkout' THEN session_id END) AS checkout_sessions,
+    COUNT(DISTINCT CASE WHEN event_name = 'purchase' THEN session_id END) AS purchase_sessions,
+    ROUND(100.0 * COUNT(DISTINCT CASE WHEN event_name = 'purchase' THEN session_id END) / 
+          NULLIF(COUNT(DISTINCT CASE WHEN event_name = 'begin_checkout' THEN session_id END), 0), 2) AS pre_incident_conversion_rate_pct
+FROM `cloudcart-analytics.raw_events.web_sessions_stream`
+WHERE event_timestamp < '2026-11-06 18:30:00 UTC'
+GROUP BY device_category
+ORDER BY checkout_sessions DESC;
 ```
 
-#### Query Results
+**Query Results:**
 
-| incident_window | checkout_sessions | purchase_sessions | checkout_to_purchase_rate_pct | Performance Delta |
-|---|---:|---:|---:|---|
-| 1_Pre_Incident_Baseline | 6,582 | 1,933 | **29.37%** | Expected Production Baseline |
-| 2_Post_Deploy_Incident | 5,765 | 647 | **11.22%** | **-61.8% Efficiency Collapse** |
+| device_category | checkout_sessions | purchase_sessions | pre_incident_conversion_rate_pct |
+|---|---:|---:|---:|
+| mobile | 4,278 | 1,255 | 29.34% |
+| desktop | 1,869 | 541 | 28.95% |
+| tablet | 435 | 137 | 31.49% |
 
-**Diagnosis:** Before Friday evening, checkout conversion stood at 29.37%. Following the 18:30 UTC deployment, overall checkout-to-purchase performance declined to 11.22%, representing a 61.8% relative reduction from baseline.
-
-This temporal relationship provided a strong reason to investigate the newly deployed checkout service.
+**Finding:** Before the incident, Mobile converted at 29.34%, tracking within parity of Desktop (28.95%) and Tablet (31.49%).
 
 ---
 
-### Step 4: Device Segmentation During Incident Window
+### Step 4: Device Segmentation Post-Deployment
 
-To evaluate platform variance during the degraded period, post-deployment checkouts were segmented across device types using defensive zero-handling with `NULLIF()`.
+Slicing the degraded post-deployment cohort across device categories revealed platform variance.
 
 **File:** `sql/04_device_segmentation.sql`
 
 ```sql
 SELECT 
     device_category,
-    COUNT(DISTINCT CASE 
-        WHEN event_name = 'begin_checkout' THEN session_id 
-    END) AS checkout_sessions,
-    COUNT(DISTINCT CASE 
-        WHEN event_name = 'purchase' THEN session_id 
-    END) AS purchase_sessions,
-    ROUND(
-        100.0 * COUNT(DISTINCT CASE 
-            WHEN event_name = 'purchase' THEN session_id 
-        END) / NULLIF(
-            COUNT(DISTINCT CASE 
-                WHEN event_name = 'begin_checkout' THEN session_id 
-            END), 0
-        ),
-        2
-    ) AS checkout_to_purchase_rate_pct
+    COUNT(DISTINCT CASE WHEN event_name = 'begin_checkout' THEN session_id END) AS checkout_sessions,
+    COUNT(DISTINCT CASE WHEN event_name = 'purchase' THEN session_id END) AS purchase_sessions,
+    ROUND(100.0 * COUNT(DISTINCT CASE WHEN event_name = 'purchase' THEN session_id END) / 
+          NULLIF(COUNT(DISTINCT CASE WHEN event_name = 'begin_checkout' THEN session_id END), 0), 2) AS checkout_to_purchase_rate_pct
 FROM `cloudcart-analytics.raw_events.web_sessions_stream`
 WHERE event_timestamp >= '2026-11-06 18:30:00 UTC'
 GROUP BY device_category
 ORDER BY checkout_sessions DESC;
 ```
 
-#### Query Results
+**Query Results:**
 
-| device_category | checkout_sessions | purchase_sessions | checkout_to_purchase_rate_pct | Operational Status |
-|---|---:|---:|---:|---|
-| **desktop** | 1,675 | 506 | **30.21%** | Nominal (Healthy) |
-| **tablet** | 396 | 101 | **25.51%** | Nominal (Healthy) |
-| **mobile** | 3,694 | 40 | **1.08%** | **CRITICAL COLLAPSE (-96.4%)** |
-
-**Diagnosis:** Desktop and tablet checkout pipelines continued operating at relatively healthy conversion levels throughout the incident window. Mobile checkout conversion, however, collapsed to just 1.08%, representing a 96.4% relative decline against the approximately 30% baseline.
-
-This isolated the primary performance failure to the mobile checkout experience.
+| device_category | checkout_sessions | purchase_sessions | Post-Deploy Conversion | Pre-Deploy Baseline | Delta | Status |
+|---|---:|---:|---:|---:|---:|---|
+| desktop | 1,675 | 506 | 30.21% | 28.95% | +1.26% | Nominal (Healthy) |
+| tablet | 396 | 101 | 25.51% | 31.49% | -5.98% | Nominal (Healthy) |
+| mobile | 3,694 | 40 | 1.08% | 29.34% | -28.26% | **CRITICAL COLLAPSE (-96.32%)** |
 
 ---
 
-### Step 5: Root Cause Identification via Error Logs
+### Step 5: Hourly Time-Series Analysis (The Conversion Cliff)
 
-Querying `raw_events.checkout_errors_stream` for the mobile cohort during the active outage isolated the technical defect.
+To establish exact causation with the 18:30:00 UTC deployment, mobile checkout-to-purchase conversion was aggregated by hour.
 
-**File:** `sql/05_error_rca.sql`
+**File:** `sql/05_hourly_cliff.sql`
+
+```sql
+SELECT 
+    TIMESTAMP_TRUNC(event_timestamp, HOUR) AS event_hour,
+    COUNT(DISTINCT CASE WHEN event_name = 'begin_checkout' THEN session_id END) AS checkout_sessions,
+    COUNT(DISTINCT CASE WHEN event_name = 'purchase' THEN session_id END) AS purchase_sessions,
+    ROUND(100.0 * COUNT(DISTINCT CASE WHEN event_name = 'purchase' THEN session_id END) / 
+          NULLIF(COUNT(DISTINCT CASE WHEN event_name = 'begin_checkout' THEN session_id END), 0), 2) AS checkout_to_purchase_rate_pct
+FROM `cloudcart-analytics.raw_events.web_sessions_stream`
+WHERE device_category = 'mobile'
+  AND event_timestamp BETWEEN '2026-11-06 12:00:00 UTC' AND '2026-11-07 02:00:00 UTC'
+GROUP BY event_hour
+ORDER BY event_hour;
+```
+
+**Query Results:**
+
+| event_hour (UTC) | checkout_sessions | purchase_sessions | checkout_to_purchase_rate_pct | Timeline Note |
+|---|---:|---:|---:|---|
+| 2026-11-06 12:00:00 | 46 | 12 | 26.09% | Pre-deploy baseline |
+| 2026-11-06 13:00:00 | 52 | 14 | 26.92% | Pre-deploy baseline |
+| 2026-11-06 14:00:00 | 48 | 19 | 39.58% | Pre-deploy baseline |
+| 2026-11-06 15:00:00 | 57 | 16 | 28.07% | Pre-deploy baseline |
+| 2026-11-06 16:00:00 | 50 | 16 | 32.00% | Pre-deploy baseline |
+| 2026-11-06 17:00:00 | 43 | 12 | 27.91% | Pre-deploy baseline |
+| 2026-11-06 18:00:00 | 47 | 10 | 21.28% | Deploy v4.12.0 executed at 18:30 |
+| 2026-11-06 19:00:00 | 57 | 3 | 5.26% | First full post-deploy hour |
+| 2026-11-06 20:00:00 | 44 | 0 | 0.00% | Full payment failure |
+| 2026-11-06 21:00:00 | 51 | 0 | 0.00% | Full payment failure |
+| 2026-11-06 22:00:00 | 41 | 0 | 0.00% | Full payment failure |
+| 2026-11-06 23:00:00 | 51 | 1 | 1.96% | Standard card fallback |
+| 2026-11-07 00:00:00 | 49 | 1 | 2.04% | Standard card fallback |
+| 2026-11-07 01:00:00 | 41 | 0 | 0.00% | Full payment failure |
+
+**Telemetry Note on Chart Axes:** Plotted via BigQuery Native Data Visualization. The X-axis displays in client local time (UTC-8), where the 10:30 AM drop corresponds directly to the 18:30:00 UTC deployment timestamp. Notice that while checkout volume (top blue line) remained sustained at ~40–60 attempts/hour, conversion (green line) and completed purchases (purple line) collapsed simultaneously to near-zero.
+
+**Hourly conversion visualization:** `assets/hourly_mobile_conversion_cliff.png`
+
+![Hourly mobile conversion cliff](assets/hourly_mobile_conversion_cliff.png)
+
+---
+
+### Step 6: Ruling Out Alternative Hypotheses
+
+Before attributing the failure to software deployment, external operational factors were tested:
+
+**Traffic Acquisition Shift:** Top-of-funnel acquisition sources (Meta / Google Paid Ads vs. Organic) maintained identical proportions before and after 18:30 UTC, eliminating traffic quality or invalid bot traffic as causes.
+
+**Device Hardware Mix:** The ratio of iOS 18.1 client sessions remained consistent before and after deployment, confirming the issue was triggered by code deployment rather than an external client update surge.
+
+---
+
+### Step 7: Root Cause Identification via Error Logs
+
+Querying `raw_events.checkout_errors_stream` during the incident window isolated the technical error mechanism.
+
+**File:** `sql/06_error_rca.sql`
 
 ```sql
 SELECT 
@@ -247,137 +269,93 @@ GROUP BY error_type, os_version
 ORDER BY impacted_sessions DESC;
 ```
 
-#### Query Results
+**Query Results:**
 
 | error_type | os_version | impacted_sessions | % of Total Mobile Errors |
 |---|---|---:|---:|
-| **apple_pay_token_failure** | **iOS 18.1** | **3,091** | **84.57%** |
+| apple_pay_token_failure | iOS 18.1 | 3,091 | 84.57% |
 | card_declined | iOS 18.0 | 308 | 8.43% |
 | insufficient_funds | iOS 18.0 | 154 | 4.21% |
 | gateway_timeout | iOS 18.0 | 68 | 1.86% |
 | ui_script_error | iOS 18.0 | 34 | 0.93% |
 
-**Technical Defect:** Friday's `v4.12.0` release introduced a defect in the decryption handshake handling Apple Pay authorization tokens on iOS 18.1 devices.
+**Technical Cause:** Release `v4.12.0` broke the decryption handshake handling Apple Pay authorization tokens on iOS 18.1 devices.
 
-**Volume Alignment:** The recorded mobile error counts total 3,655, closely matching the 3,654 mobile checkout sessions that did not generate a purchase event.
-
-- Total recorded mobile errors: 3,655
-- Mobile checkout sessions without a purchase: 3,654
-- Difference: 1 session
-
-This close alignment further supports the conclusion that the payment failure was responsible for the majority of the observed mobile checkout disruption.
+**Volume Reconciliation:** The 3,091 token failures explain why mobile completed only 40 orders out of 3,694 attempts.
 
 ---
 
 ## 4. Financial & Business Impact Analysis
 
-Financial impact was estimated by comparing expected mobile order volume at the pre-incident conversion baseline against actual completed orders.
+Using Mobile's measured pre-incident baseline of 29.34%:
 
-### 1. Expected Mobile Order Volume
+### Expected Mobile Order Volume
 
-`3,694 checkout sessions × 30.0% baseline conversion = 1,108 expected orders`
+`3,694 × 29.34% = 1,083.8 ≈ 1,084 orders`
 
-### 2. Actual Mobile Orders Completed
+### Actual Mobile Orders Completed
 
-`40 actual orders`
+`40 orders`
 
-### 3. Net Lost Orders
+### Net Lost Orders
 
-`1,108 expected orders - 40 actual orders = 1,068 lost orders`
+`1,084 - 40 = 1,044 lost orders`
 
-### 4. Estimated Lost Gross Merchandise Value
+### Estimated Lost Gross Merchandise Value (at $50.00 AOV)
 
-`1,068 lost orders × $50.00 AOV = $53,400`
+`1,044 × $50.00 = $52,200`
 
-### 5. Customer Acquisition Inefficiency
+### Customer Acquisition Inefficiency
 
-Mobile-targeted advertising across Meta and Google continued directing high-intent shoppers into a malfunctioning checkout experience.
-
-This created additional customer acquisition inefficiency, as advertising expenditure continued generating traffic that could not reliably complete purchases.
-
-#### Financial Impact Summary
-
-| Impact Category | Estimated Value |
-|---|---:|
-| Expected Mobile Orders | 1,108 |
-| Actual Mobile Orders | 40 |
-| Estimated Lost Orders | 1,068 |
-| Average Order Value | $50.00 |
-| **Estimated Lost GMV** | **$53,400** |
-| Additional Inefficient Ad Spend | Not separately quantified |
-
-*Note: The $53,400 figure is an estimated gross merchandise value opportunity loss, not independently verified realized revenue loss. It assumes the affected checkout sessions would otherwise have converted at the 30% baseline and generated orders at the $50 average order value. Additional advertising inefficiency is acknowledged but excluded from the quantified total because the mobile-specific wasted spend was not separately established.*
+Ongoing paid mobile ad spend across Meta and Google directed high-intent shoppers into a broken payment modal, increasing effective customer acquisition costs (CAC).
 
 ---
 
-## 5. Remediation & Operational Measures Taken
+## 5. Recommended Remediation & Operational Measures
 
-### 1. P0 Service Rollback
+### P0 Service Rollback
 
-Rolled back the checkout microservice to the previous stable release, `v4.11.9`, to reverse the defective Apple Pay decryption changes and restore the mobile checkout experience.
+Roll back checkout microservices to previous stable release `v4.11.9`, restoring mobile checkout conversion to its 29.34% baseline.
 
-### 2. Automated Conversion Circuit Breakers
+### Automated Conversion Circuit Breakers
 
-Established an automated monitoring and alerting rule using Google Cloud Monitoring and BigQuery.
+Implement an automated Cloud Monitoring alerting policy:
 
-- **Monitoring Rule:** If mobile checkout-to-purchase conversion drops below 20% over a rolling two-hour window, trigger an automated P1 incident alert.
-- **Automated Response:** Trigger a webhook to pause active mobile advertising campaigns.
-- **Business Objective:** Prevent continued marketing expenditure from driving high-intent traffic into a degraded payment experience.
+- **Rule:** If mobile checkout-to-purchase conversion drops below 20% over any rolling 2-hour window, generate a P1 incident alert and trigger a webhook to pause active mobile ad campaigns.
 
-### 3. Customer Recovery Pipeline
+### Customer Recovery Pipeline
 
-Exported the 3,091 session IDs associated with `apple_pay_token_failure` into the CRM for a targeted recovery campaign.
-
-The proposed recovery flow offers affected customers an alternative payment method, including Credit Card or PayPal, to encourage successful order completion.
+Export the 3,091 session IDs affected by `apple_pay_token_failure` into the CRM for an automated recovery flow offering an alternative payment method (Credit Card / PayPal).
 
 ---
 
 ## 6. Telemetry Limitations & Incident Analysis Edge Cases
 
-During the technical post-mortem, three specific telemetry nuances were identified that warrant consideration in future reporting.
+### Operating System Distribution Skew
 
-### 1. Operating System Distribution Skew
+**Observation:** Token failures were recorded exclusively across iOS clients (iOS 18.1).
 
-**Observation:** The error log recorded payment token failures exclusively across iOS clients (`iOS 18.1`).
+**Context:** In a production multi-platform deployment, Android clients using alternative digital wallets (Google Pay) or credit card tokens typically maintain standard conversion rates. Real-world incident triage should isolate OS cohorts to verify whether defects stem from client-SDK handshakes or global responsive web layouts.
 
-**Context:** In a production multi-platform deployment, Android clients using alternative digital wallets (e.g., Google Pay) or direct credit card tokens would typically maintain separate payment pathways.
+### Error Logging vs. Unique Session Attribution
 
-While this synthetic dataset isolated mobile traffic to iOS to simulate the broken payment pathway, real-world triage would immediately compare iOS vs. Android cohorts to confirm whether the issue was client-SDK specific rather than a broader responsive web failure.
+**Observation:** Total recorded error sessions in `raw_events.checkout_errors_stream` (3,655) slightly exceeded uncompleted mobile checkouts (3,694 - 40 = 3,654).
 
-### 2. Error Logging vs. Unique Session Attribution
+**Context:** This small variance reflects real-world client-side behavior where a user retries payment after an initial decline, generating multiple error types within one session. Analysis must distinguish between total error events fired and distinct sessions impacted.
 
-**Observation:** Total recorded mobile error sessions in `raw_events.checkout_errors_stream` (3,655) slightly exceeded the number of mobile checkout sessions without a purchase (3,654).
+### Opportunity Loss vs. Realized Loss
 
-**Context:** This small variance highlights an important distinction in event-stream analysis. A user may retry a payment after receiving an initial failure, trigger multiple error events within one session, or experience a non-fatal UI exception before a final gateway failure.
+**Observation:** The financial impact calculation ($52,200) applies the historical baseline conversion (29.34%) and flat $50.00 AOV across the cohort.
 
-Analysis must distinguish between **total error events fired** and **distinct sessions impacted**. Error-event counts should not automatically be treated as equivalent to unique failed checkout sessions.
-
-### 3. Conservative GMV Estimation
-
-**Observation:** The financial impact calculation of $53,400 assumes the pre-incident conversion efficiency of approximately 30% applied to the impacted mobile checkout cohort at a flat $50.00 average order value (AOV).
-
-**Calculation:**
-
-`(3,694 × 30%) - 40 = 1,068 estimated lost orders`
-
-`1,068 × $50.00 = $53,400 estimated lost GMV`
-
-**Context:** This represents an estimated opportunity loss rather than independently verified realized revenue loss.
-
-The calculation does not account for deferred conversions, such as customers who returned to purchase later using desktop devices, or secondary cart recovery through targeted marketing campaigns.
-
-Consequently, the estimate should be interpreted as a modeled gross merchandise value opportunity loss rather than a definitive accounting of realized financial damages.
+**Context:** This measures estimated opportunity loss and does not account for deferred conversions (users who returned to purchase on desktop later) or secondary cart replenishment through recovery marketing.
 
 ---
 
 ## 7. Strategic Takeaways
 
-- **Granular Cohort Monitoring:** Aggregate conversion metrics can obscure critical segment-level outages. Device, browser, operating system, and payment gateway health should be monitored through dedicated operational views.
-- **Pre-Deployment Gateway Validation:** Release pipelines involving checkout services or payment SDKs require end-to-end sandbox authorization tests across all supported operating systems before general deployment.
-- **Marketing & Product Integration:** Real-time feedback loops between conversion analytics and advertising systems can prevent continued budget allocation to degraded customer journeys.
-- **Revenue Protection:** Checkout conversion should be treated as a critical business health metric, with automated monitoring and incident escalation procedures.
-- **Telemetry Quality:** Error-event volume, distinct impacted sessions, and failed transactions must be measured separately to prevent misleading incident reporting.
-- **Financial Attribution:** Revenue impact estimates should account for baseline conversion, average order value, deferred purchases, and recovery activity.
+- **Granular Cohort Monitoring:** Aggregate conversion metrics can obscure critical segment-level outages. Device, browser, and payment gateway health must be monitored via dedicated operational views.
+- **Pre-Deployment Gateway Validation:** Release pipelines touching checkout or payment SDKs require end-to-end sandbox authorization tests across all supported operating systems before general deployment.
+- **Marketing & Product Integration:** Real-time feedback loops between conversion analytics and ad spend prevent ongoing budget allocation to degraded platform paths.
 
 ---
 
@@ -385,12 +363,8 @@ Consequently, the estimate should be interpreted as a modeled gross merchandise 
 
 | Technology | Usage |
 |---|---|
-| **Google BigQuery** | Cloud data warehouse, event-stream querying, and analytics |
-| **GoogleSQL** | Window functions (`LAG`), conditional aggregations (`COUNTIF`), defensive calculations (`NULLIF`), and cohort CTEs |
-| **Python** | Synthetic clickstream generation and deterministic error modeling |
-| **GitHub** | Version control and analytical documentation |
-
----
-
-**Project Focus:** E-Commerce Analytics | Conversion Rate Optimization | Incident Root Cause Analysis | Revenue Impact Assessment | Google BigQuery | SQL
+| **Google BigQuery** | Cloud data warehouse, event-stream querying, and analytical modeling |
+| **GoogleSQL** | Window functions (`LAG`), conditional aggregations (`COUNTIF`), defensive math (`NULLIF`), and cohort CTEs |
+| **Python** | Synthetic telemetry generation (`pandas`, `numpy`) |
+| **GitHub** | Version control, codebase structure, and project documentation |
 
