@@ -290,7 +290,7 @@ Mobile-targeted advertising across Meta and Google continued directing high-inte
 
 This created additional customer acquisition inefficiency, as advertising expenditure continued generating traffic that could not reliably complete purchases.
 
-**Financial Impact Summary**
+#### Financial Impact Summary
 
 | Impact Category | Estimated Value |
 |---|---:|
@@ -327,16 +327,56 @@ The proposed recovery flow offers affected customers an alternative payment meth
 
 ---
 
-## 6. Strategic Takeaways
+## 6. Telemetry Limitations & Incident Analysis Edge Cases
+
+During the technical post-mortem, three specific telemetry nuances were identified that warrant consideration in future reporting.
+
+### 1. Operating System Distribution Skew
+
+**Observation:** The error log recorded payment token failures exclusively across iOS clients (`iOS 18.1`).
+
+**Context:** In a production multi-platform deployment, Android clients using alternative digital wallets (e.g., Google Pay) or direct credit card tokens would typically maintain separate payment pathways.
+
+While this synthetic dataset isolated mobile traffic to iOS to simulate the broken payment pathway, real-world triage would immediately compare iOS vs. Android cohorts to confirm whether the issue was client-SDK specific rather than a broader responsive web failure.
+
+### 2. Error Logging vs. Unique Session Attribution
+
+**Observation:** Total recorded mobile error sessions in `raw_events.checkout_errors_stream` (3,655) slightly exceeded the number of mobile checkout sessions without a purchase (3,654).
+
+**Context:** This small variance highlights an important distinction in event-stream analysis. A user may retry a payment after receiving an initial failure, trigger multiple error events within one session, or experience a non-fatal UI exception before a final gateway failure.
+
+Analysis must distinguish between **total error events fired** and **distinct sessions impacted**. Error-event counts should not automatically be treated as equivalent to unique failed checkout sessions.
+
+### 3. Conservative GMV Estimation
+
+**Observation:** The financial impact calculation of $53,400 assumes the pre-incident conversion efficiency of approximately 30% applied to the impacted mobile checkout cohort at a flat $50.00 average order value (AOV).
+
+**Calculation:**
+
+`(3,694 × 30%) - 40 = 1,068 estimated lost orders`
+
+`1,068 × $50.00 = $53,400 estimated lost GMV`
+
+**Context:** This represents an estimated opportunity loss rather than independently verified realized revenue loss.
+
+The calculation does not account for deferred conversions, such as customers who returned to purchase later using desktop devices, or secondary cart recovery through targeted marketing campaigns.
+
+Consequently, the estimate should be interpreted as a modeled gross merchandise value opportunity loss rather than a definitive accounting of realized financial damages.
+
+---
+
+## 7. Strategic Takeaways
 
 - **Granular Cohort Monitoring:** Aggregate conversion metrics can obscure critical segment-level outages. Device, browser, operating system, and payment gateway health should be monitored through dedicated operational views.
 - **Pre-Deployment Gateway Validation:** Release pipelines involving checkout services or payment SDKs require end-to-end sandbox authorization tests across all supported operating systems before general deployment.
 - **Marketing & Product Integration:** Real-time feedback loops between conversion analytics and advertising systems can prevent continued budget allocation to degraded customer journeys.
 - **Revenue Protection:** Checkout conversion should be treated as a critical business health metric, with automated monitoring and incident escalation procedures.
+- **Telemetry Quality:** Error-event volume, distinct impacted sessions, and failed transactions must be measured separately to prevent misleading incident reporting.
+- **Financial Attribution:** Revenue impact estimates should account for baseline conversion, average order value, deferred purchases, and recovery activity.
 
 ---
 
-## 7. Technology Stack
+## 8. Technology Stack
 
 | Technology | Usage |
 |---|---|
